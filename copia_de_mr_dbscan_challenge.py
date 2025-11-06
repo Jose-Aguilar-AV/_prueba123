@@ -261,3 +261,207 @@ print(f"  - Número de particiones Spark: {spark_df.rdd.getNumPartitions()}")
 print(f"  - Total de registros: {spark_df.count():,}")
 print(f"\nEstructura de datos:")
 spark_df.printSchema()
+
+"""
+---
+
+# PARTE 3: DBSCAN LOCAL Y GENERACIÓN DE MC SETS
+## Responsable: Miguel
+
+### Paso 3.1: DBSCAN Local en Cada Partición
+
+**¿Qué hace este paso? (Stage 2 del paper)**
+
+Este es el corazón del clustering. Para cada partición:
+
+1. **Ejecuta DBSCAN localmente:** Aplica el algoritmo clásico DBSCAN a los puntos de la partición
+2. **Clasifica puntos:** Etiqueta cada punto como:
+   - **Core Point (C):** Tiene ≥ MinPts vecinos dentro de Eps
+   - **Border Point (B):** Tiene < MinPts vecinos pero es vecino de un Core Point
+   - **Noise (N):** No cumple ninguna condición (outlier)
+3. **Genera clusters locales:** Crea cluster IDs locales por partición
+
+**Parámetros importantes:**
+- **Eps = 0.002:** Radio de búsqueda (distancia máxima a vecinos)
+- **MinPts = 1000:** Mínimo número de puntos para ser Core Point
+
+**Algoritmo DBSCAN en pseudocódigo:**
+```
+Para cada punto p no visitado:
+  1. Si p tiene < MinPts vecinos → marcar como Noise
+  2. Si p tiene ≥ MinPts vecinos → marcar como Core Point
+  3. Expandir: recursivamente procesar todos sus vecinos
+  4. Crear cluster cuando se termina la expansión
+```
+
+**¿Por qué es importante?**
+- Cada nodo ejecuta esta operación independientemente (paralelismo real)
+- Los resultados locales se combinan después en el Stage 4
+- Reduce significativamente la complejidad computacional general
+
+**Complejidad:**
+- Tiempo: O(n * log n) con indexación espacial, O(n²) sin indexación
+- Espacio: O(n) para almacenar el dataset
+
+"""
+
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import KDTree
+import scipy.spatial.distance as spatial_distance
+
+# Definir parámetros DBSCAN
+EPS = 0.002  # Radio de búsqueda en coordenadas normalizadas
+MIN_SAMPLES = 1000  # Mínimo número de puntos para ser Core Point
+
+print(f"Parámetros de DBSCAN:")
+print(f"  - Eps: {EPS}")
+print(f"  - MinPts: {MIN_SAMPLES}")
+
+def local_dbscan_partition(partition_data, eps=EPS, min_samples=MIN_SAMPLES):
+    """
+    Ejecuta DBSCAN en una partición individual.
+
+    Parámetros:
+        partition_data: DataFrame con puntos de una partición
+        eps: Radio de búsqueda
+        min_samples: Mínimo de puntos para Core Point
+
+    Retorna:
+        array: Etiquetas de cluster locales para cada punto (-1 = noise)
+    """
+    coords = partition_data[['lon_norm', 'lat_norm']].values
+
+    # Si la partición tiene pocos puntos, todos son noise
+    if len(coords) < min_samples:
+        return np.array([-1] * len(coords))
+
+    # Ejecutar DBSCAN
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean', n_jobs=-1)
+    labels = db.fit_predict(coords)
+
+    return labels
+
+# Aplicar DBSCAN a cada partición
+print(f"\n⏳ Ejecutando DBSCAN local en {n_partitions} particiones...")
+
+data['local_cluster'] = -1  # Inicializar
+
+for partition_id, group_idx in data.groupby('partition_id').groups.items():
+    group = data.loc[group_idx]
+    labels = local_dbscan_partition(group)
+    data.loc[group_idx, 'local_cluster'] = labels
+
+print(f"✓ DBSCAN local completado")
+print(f"  - Puntos en clusters: {(data['local_cluster'] != -1).sum():,}")
+print(f"  - Puntos noise/outliers: {(data['local_cluster'] == -1).sum():,}")
+print(f"  - Total de clusters locales: {data['local_cluster'].max() + 1:.0f}")
+
+# Mostrar estadísticas por partición
+print(f"\nEstadísticas por partición:")
+stats = data.groupby('partition_id').agg({
+    'local_cluster': lambda x: (x != -1).sum(),
+    'partition_id': 'count'
+}).rename(columns={'local_cluster': 'clusters', 'partition_id': 'total_points'})
+stats['noise'] = stats['total_points'] - stats['clusters']
+print(stats.head(10))
+
+"""
+### Paso 3.2: Identificación de Puntos Frontera (MC Sets)
+
+**¿Qué hace este paso? (Preparación para Stage 3)**
+
+Identifica puntos especiales que **cruzan fronteras entre particiones**:
+
+1. **Puntos frontera:** Puntos cuyo vecindario Eps-distance cruza hacia otra partición
+2. **MC Sets (Merge Candidate Sets):** Conjuntos de puntos que potencialmente deben fusionarse
+3. **Clasificación:** Marca los puntos que necesitarán procesamiento especial
+
+**¿Por qué es importante?**
+- DBSCAN local NO ve puntos en otras particiones
+- Dos clusters en particiones vecinas podrían ser el MISMO cluster globalmente
+- Necesitamos identificar estos casos ANTES de hacer la fusión
+
+**Concepto clave - El problema de las fronteras:**
+
+```
+Partición A        |  Partición B
+    ●●●●●●●●●●●●●●|●●●●●●●●●●●●●
+    ●●●●●●●●●●●●●●|●●●●●●●●●●●●●
+
+Local en A: cluster 1
+Local en B: cluster 1
+Pero podrían ser el MISMO cluster si un punto de A está cerca de B
+
+→ Los puntos cerca de la frontera deben compararse entre particiones
+```
+
+"""
+
+# Identificar puntos frontera (dentro de Eps de la frontera de la partición)
+def identify_border_points(partition_data, eps=EPS):
+    """
+    Identifica puntos de una partición que están cerca de sus fronteras.
+
+    Un punto es "frontera" si su vecindario Eps puede incluir puntos de otras particiones.
+    """
+    coords = partition_data[['lon_norm', 'lat_norm']].values
+
+    if len(coords) == 0:
+        return np.array([], dtype=bool)
+
+    # Obtener límites de la partición (aproximado usando percentiles)
+    lon_min, lon_max = coords[:, 0].min(), coords[:, 0].max()
+    lat_min, lat_max = coords[:, 1].min(), coords[:, 1].max()
+
+    # Marcar como frontera si está dentro de Eps de cualquier borde
+    is_border = (
+        (coords[:, 0] < lon_min + eps) |  # Cerca borde oeste
+        (coords[:, 0] > lon_max - eps) |  # Cerca borde este
+        (coords[:, 1] < lat_min + eps) |  # Cerca borde sur
+        (coords[:, 1] > lat_max - eps)    # Cerca borde norte
+    )
+
+    return is_border
+
+# Aplicar a cada partición
+print(f"⏳ Identificando puntos frontera...")
+data['is_border'] = False
+
+for partition_id, group_idx in data.groupby('partition_id').groups.items():
+    group = data.loc[group_idx]
+    border_flags = identify_border_points(group)
+    data.loc[group_idx, 'is_border'] = border_flags
+
+# Mostrar resultados
+n_border = data['is_border'].sum()
+pct_border = 100 * n_border / len(data)
+
+print(f"✓ Puntos frontera identificados")
+print(f"  - Total puntos frontera: {n_border:,} ({pct_border:.1f}%)")
+print(f"  - Puntos internos: {(~data['is_border']).sum():,}")
+
+# Crear MC Sets (Merge Candidate Sets)
+# Estos son pares de clusters que potencialmente deben fusionarse
+mc_sets = []
+
+for partition_id, group_idx in data.groupby('partition_id').groups.items():
+    group = data.loc[group_idx]
+    border_points = group[group['is_border']]
+
+    if len(border_points) > 0:
+        for idx, row in border_points.iterrows():
+            if row['local_cluster'] != -1:  # No contar noise points
+                mc_sets.append({
+                    'partition_id': partition_id,
+                    'point_id': idx,
+                    'cluster_id': row['local_cluster'],
+                    'lon': row['lon_norm'],
+                    'lat': row['lat_norm']
+                })
+
+mc_df = pd.DataFrame(mc_sets)
+print(f"\n✓ MC Sets (Merge Candidates) creados")
+print(f"  - Total de candidatos para fusión: {len(mc_df):,}")
+if len(mc_df) > 0:
+    print(f"  - Clusters únicos en MC: {mc_df['cluster_id'].nunique()}")
+    print(f"  - Particiones con candidatos: {mc_df['partition_id'].nunique()}")
